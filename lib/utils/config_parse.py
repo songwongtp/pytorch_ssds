@@ -128,6 +128,7 @@ __C.TRAIN.LR_SCHEDULER.MAX_EPOCHS = __C.TRAIN.MAX_EPOCHS - __C.TRAIN.LR_SCHEDULE
 # ---------------------------------------------------------------------------- #
 __C.TEST = AttrDict()
 __C.TEST.BATCH_SIZE = __C.TRAIN.BATCH_SIZE
+# List of epoch numbers for testing
 __C.TEST.TEST_SCOPE = [0, 300]
 
 
@@ -194,7 +195,7 @@ __C.EXP_DIR = osp.abspath(osp.join(__C.ROOT_DIR, 'experiments/models/'))
 __C.LOG_DIR = __C.EXP_DIR
 __C.RESUME_CHECKPOINT = ''
 __C.CHECKPOINTS_PREFIX = '{}_{}_{}'.format(__C.MODEL.SSDS, __C.MODEL.NETS, __C.DATASET.DATASET)
-__C.PHASE = ['train', 'eval', 'test']
+__C.PHASE = ['train', 'eval', 'test', 'eval_subimg']
 
 # def _merge_a_into_b(a, b):
 #   """Merge config dictionary a into config dictionary b, clobbering the
