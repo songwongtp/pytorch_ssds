@@ -2,8 +2,9 @@
 This repo is based on the work of [ssd.pytorch](https://github.com/ShuangXieIrene/ssds.pytorch)
 
 ## Installation
-1. pytorch == 0.3.1
-2. install requirements by `pip install -r ./requirements.txt`
+1. python == 3.6
+2. pytorch == 0.3.1
+3. install requirements by `pip install -r ./requirements.txt`
 
 ## Usage
 To train, test and demo some specific model. Please run the relative file in folder with the model configure file, like:
