@@ -92,7 +92,11 @@ class Solver(object):
             print(("=> no checkpoint found at '{}'".format(resume_checkpoint)))
             return False
         print(("=> loading checkpoint '{:s}'".format(resume_checkpoint)))
-        checkpoint = torch.load(resume_checkpoint)
+
+        if self.use_gpu:
+            checkpoint = torch.load(resume_checkpoint)
+        else:
+            checkpoint = torch.load(resume_checkpoint, map_location='cpu')
 
         # print("=> Weigths in the checkpoints:")
         # print([k for k, v in list(checkpoint.items())])
