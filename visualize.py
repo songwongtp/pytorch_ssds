@@ -17,22 +17,31 @@ import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 
 from lib.utils.config_parse import cfg_from_file
-from lib.utils.config_parse import cfg
+from lib.layers import *
+from lib.utils.timer import Timer
+from lib.utils.data_augment import preproc
 from lib.modeling.model_builder import create_model
+from lib.dataset.dataset_factory import load_data
+from lib.utils.config_parse import cfg
+from lib.utils.eval_utils import *
+from lib.utils.visualize_utils import *
+from lib import subimg_utils
+
+import json
+
+config_file = "./experiments/cfgs/attfssd_lite_mobilenetv2_eval_house_embed_att.yml"
+HOUSE_CLASSES = ['__background__', # always index 0
+        'door', 'garage_door', 'window']
 
 def parse_args():
     """
     Parse input arguments
     """
     parser = argparse.ArgumentParser(description='Train a ssds.pytorch network')
-    parser.add_argument('--cfg', dest='config_file',
-            help='optional config file', default=None, type=str)
     parser.add_argument('--path', dest='image_path',
             help='optional image path', default=None, type=str)
-    parser.add_argument('--subimg', dest='use_subimage',
-            help='optional image path', default=True, type=bool)
 
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         parser.print_help()
         sys.exit(1)
 
@@ -45,6 +54,7 @@ class Solver(object):
     """
     def __init__(self):
         self.cfg = cfg
+        self.preproc = preproc(cfg.DATASET.IMAGE_SIZE, cfg.DATASET.PIXEL_MEANS, -2)
 
         # Build model
         print('===> Building model')
@@ -69,43 +79,24 @@ class Solver(object):
         num_parameters = sum([l.nelement() for l in self.model.parameters()])
         print('number of parameters: {}'.format(num_parameters))
 
-        print('Trainable scope: {}'.format(cfg.TRAIN.TRAINABLE_SCOPE))
-        trainable_param = self.trainable_param(cfg.TRAIN.TRAINABLE_SCOPE)
-        self.optimizer = self.configure_optimizer(trainable_param, cfg.TRAIN.OPTIMIZER)
-        self.exp_lr_scheduler = self.configure_lr_scheduler(self.optimizer, cfg.TRAIN.LR_SCHEDULER)
         self.max_epochs = cfg.TRAIN.MAX_EPOCHS
 
-        # metric
-        self.criterion = MultiBoxLoss(cfg.MATCHER, self.priors, self.use_gpu)
-
         # Set the logger
-        self.writer = SummaryWriter(log_dir=cfg.LOG_DIR)
         self.output_dir = cfg.EXP_DIR
         self.checkpoint = cfg.RESUME_CHECKPOINT
         self.checkpoint_prefix = cfg.CHECKPOINTS_PREFIX
 
-
-    def save_checkpoints(self, epochs, iters=None):
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-        if iters:
-            filename = self.checkpoint_prefix + '_epoch_{:d}_iter_{:d}'.format(epochs, iters) + '.pth'
-        else:
-            filename = self.checkpoint_prefix + '_epoch_{:d}'.format(epochs) + '.pth'
-        filename = os.path.join(self.output_dir, filename)
-        torch.save(self.model.state_dict(), filename)
-        with open(os.path.join(self.output_dir, 'checkpoint_list.txt'), 'a') as f:
-            f.write('epoch {epoch:d}: {filename}\n'.format(epoch=epochs, filename=filename))
-        print('Wrote snapshot to: {:s}'.format(filename))
-
-        # TODO: write relative cfg under the same page
 
     def resume_checkpoint(self, resume_checkpoint):
         if resume_checkpoint == '' or not os.path.isfile(resume_checkpoint):
             print(("=> no checkpoint found at '{}'".format(resume_checkpoint)))
             return False
         print(("=> loading checkpoint '{:s}'".format(resume_checkpoint)))
-        checkpoint = torch.load(resume_checkpoint)
+
+        if self.use_gpu:
+            checkpoint = torch.load(resume_checkpoint)
+        else:
+            checkpoint = torch.load(resume_checkpoint, map_location='cpu')
 
         # print("=> Weigths in the checkpoints:")
         # print([k for k, v in list(checkpoint.items())])
@@ -160,544 +151,128 @@ class Solver(object):
         start_epoch = 0
         return start_epoch
 
-    def trainable_param(self, trainable_scope):
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        trainable_param = []
-        for module in trainable_scope.split(','):
-            if hasattr(self.model, module):
-                # print(getattr(self.model, module))
-                for param in getattr(self.model, module).parameters():
-                    param.requires_grad = True
-                trainable_param.extend(getattr(self.model, module).parameters())
-
-        return trainable_param
-
-    def train_model(self):
-        previous = self.find_previous()
-        if previous:
-            start_epoch = previous[0][-1]
-            self.resume_checkpoint(previous[1][-1])
-        else:
-            start_epoch = self.initialize()
-
-        # export graph for the model, onnx always not works
-        # self.export_graph()
-
-        # warm_up epoch
-        warm_up = self.cfg.TRAIN.LR_SCHEDULER.WARM_UP_EPOCHS
-        for epoch in iter(range(start_epoch+1, self.max_epochs+1)):
-            #learning rate
-            sys.stdout.write('\rEpoch {epoch:d}/{max_epochs:d}:\n'.format(epoch=epoch, max_epochs=self.max_epochs))
-            if epoch > warm_up:
-                self.exp_lr_scheduler.step(epoch-warm_up)
-            if 'train' in cfg.PHASE:
-                self.train_epoch(self.model, self.train_loader, self.optimizer, self.criterion, self.writer, epoch, self.use_gpu)
-            if 'eval' in cfg.PHASE:
-                self.eval_epoch(self.model, self.eval_loader, self.detector, self.criterion, self.writer, epoch, self.use_gpu)
-            if 'test' in cfg.PHASE:
-                self.test_epoch(self.model, self.test_loader, self.detector, self.output_dir, self.use_gpu)
-            if 'visualize' in cfg.PHASE:
-                self.visualize_epoch(self.model, self.visualize_loader, self.priorbox, self.writer, epoch,  self.use_gpu)
-
-            if epoch % cfg.TRAIN.CHECKPOINTS_EPOCHS == 0:
-                self.save_checkpoints(epoch)
-
-    def test_model(self):
+    def test_model(self, image):
         previous = self.find_previous()
         if previous:
             for epoch, resume_checkpoint in zip(previous[0], previous[1]):
                 if epoch in self.cfg.TEST.TEST_SCOPE:
                     sys.stdout.write('\rEpoch {epoch:d}/{max_epochs:d}:\n'.format(epoch=epoch, max_epochs=max(self.cfg.TEST.TEST_SCOPE)))
                     self.resume_checkpoint(resume_checkpoint)
-                    if 'eval' in cfg.PHASE:
-                        self.eval_epoch(self.model, self.eval_loader, self.detector, self.criterion, self.writer, epoch, self.use_gpu)
-                    if 'eval_subimg' in cfg.PHASE:
-                        self.eval_subimg_epoch(self.model, self.eval_subimg_loader, self.detector, self.use_gpu)
-                    if 'test' in cfg.PHASE:
-                        self.test_epoch(self.model, self.test_loader, self.detector, self.output_dir , self.use_gpu)
-                    if 'visualize' in cfg.PHASE:
-                        self.visualize_epoch(self.model, self.visualize_loader, self.priorbox, self.writer, epoch,  self.use_gpu)
+                    return self.visualize_image(self.model, image, self.detector, epoch,  self.use_gpu)
         else:
             sys.stdout.write('\rCheckpoint {}:\n'.format(self.checkpoint))
             self.resume_checkpoint(self.checkpoint)
-            if 'eval' in cfg.PHASE:
-                self.eval_epoch(self.model, self.eval_loader, self.detector, self.criterion, self.writer, 0, self.use_gpu)
-            if 'eval_subimg' in cfg.PHASE:
-                self.eval_subimg_epoch(self.model, self.eval_subimg_loader, self.detector, self.use_gpu)
-            if 'test' in cfg.PHASE:
-                self.test_epoch(self.model, self.test_loader, self.detector, self.output_dir , self.use_gpu)
-            if 'visualize' in cfg.PHASE:
-                self.visualize_epoch(self.model, self.visualize_loader, self.priorbox, self.writer, 0,  self.use_gpu)
+            return self.visualize_image(self.model, image, self.detector, 0,  self.use_gpu)
 
-
-    def train_epoch(self, model, data_loader, optimizer, criterion, writer, epoch, use_gpu):
-        model.train()
-
-        epoch_size = len(data_loader)
-        batch_iterator = iter(data_loader)
-
-        loc_loss = 0
-        conf_loss = 0
-        _t = Timer()
-
-        for iteration in iter(range((epoch_size))):
-            images, targets = next(batch_iterator)
-            if use_gpu:
-                images = Variable(images.cuda())
-                targets = [Variable(anno.cuda(), volatile=True) for anno in targets]
-            else:
-                images = Variable(images)
-                targets = [Variable(anno, volatile=True) for anno in targets]
-            _t.tic()
-            # forward
-            out = model(images, phase='train')
-
-            # backprop
-            optimizer.zero_grad()
-            loss_l, loss_c = criterion(out, targets)
-
-            # some bugs in coco train2017. maybe the annonation bug.
-            if loss_l.data[0] == float("Inf"):
-                continue
-
-            loss = loss_l + loss_c
-            loss.backward()
-            optimizer.step()
-
-            time = _t.toc()
-            loc_loss += float(loss_l.data[0])
-            conf_loss += float(loss_c.data[0])
-
-            # log per iter
-            log = '\r==>Train: || {iters:d}/{epoch_size:d} in {time:.3f}s [{prograss}] || loc_loss: {loc_loss:.4f} cls_loss: {cls_loss:.4f}\r'.format(
-                    prograss='#'*int(round(10*iteration/epoch_size)) + '-'*int(round(10*(1-iteration/epoch_size))), iters=iteration, epoch_size=epoch_size,
-                    time=time, loc_loss=loss_l.data[0], cls_loss=loss_c.data[0])
-
-            sys.stdout.write(log)
-            sys.stdout.flush()
-
-        # log per epoch
-        sys.stdout.write('\r')
-        sys.stdout.flush()
-        lr = optimizer.param_groups[0]['lr']
-        log = '\r==>Train: || Total_time: {time:.3f}s || loc_loss: {loc_loss:.4f} conf_loss: {conf_loss:.4f} || lr: {lr:.6f}\n'.format(lr=lr,
-                time=_t.total_time, loc_loss=loc_loss/epoch_size, conf_loss=conf_loss/epoch_size)
-        sys.stdout.write(log)
-        sys.stdout.flush()
-
-        with open(os.path.join(self.output_dir, 'a.txt'), 'a+') as f:
-            f.write('epoch: {epoch:03d} || Total_time: {time:.3f}s || loc_loss: {loc_loss:.4f} conf_loss: {conf_loss:.4f} || lr: {lr:.6f}\n'.format(lr=lr,
-                epoch=epoch, time=_t.total_time, loc_loss=loc_loss/epoch_size, conf_loss=conf_loss/epoch_size))
-
-        # log for tensorboard
-        writer.add_scalar('Train/loc_loss', loc_loss/epoch_size, epoch)
-        writer.add_scalar('Train/conf_loss', conf_loss/epoch_size, epoch)
-        writer.add_scalar('Train/lr', lr, epoch)
-
-
-    def eval_epoch(self, model, data_loader, detector, criterion, writer, epoch, use_gpu):
+    def visualize_image(self, model, image, detector, epoch, use_gpu):
         model.eval()
 
-        epoch_size = len(data_loader)
-        batch_iterator = iter(data_loader)
-
-        loc_loss = 0
-        conf_loss = 0
+        num_classes = len(HOUSE_CLASSES)
+        
         _t = Timer()
+        
+        height, width = image.shape[:2]
 
-        label = [list() for _ in range(model.num_classes)]
-        gt_label = [list() for _ in range(model.num_classes)]
-        score = [list() for _ in range(model.num_classes)]
-        size = [list() for _ in range(model.num_classes)]
-        npos = [0] * model.num_classes
+        final_boxes = []
+        final_classes = []
+        final_scores = []
 
-        for iteration in iter(range((epoch_size))):
-        # for iteration in iter(range((10))):
-            images, targets = next(batch_iterator)
-            if use_gpu:
-                images = Variable(images.cuda())
-                targets = [Variable(anno.cuda(), volatile=True) for anno in targets]
-            else:
-                images = Variable(images)
-                targets = [Variable(anno, volatile=True) for anno in targets]
+        #"""
+        ratio = 0.7
+        cropped_width = int(math.ceil(width * ratio))
+        cropped_height = int(math.ceil(height * ratio))
+            
+        if width >= height:
+            width_step = [int(math.ceil(i * (1-ratio) / 3 * width)) for i in range(4)]
+            height_step = [int(math.ceil(i * (1-ratio) / 2 * height)) for i in range(3)]
+        else:
+            width_step = [int(math.ceil(i * (1-ratio) / 2 * width)) for i in range(3)]
+            height_step = [int(math.ceil(i * (1-ratio) / 3 * height)) for i in range(4)]
+        
+        step = 0
+            
+        _t.tic()
+        for left in width_step:
+            for upper in height_step:
+                step += 1
+                    
+                w = min(cropped_width, width - left)
+                h = min(cropped_height, height - upper)
+                pos = [left, upper, left, upper]
+                scale = [w, h, w, h]
 
-            _t.tic()
-            # forward
-            out = model(images, phase='train')
+                cropped_image = image[upper:upper+h, left:left+w]
 
-            # loss
-            loss_l, loss_c = criterion(out, targets)
+                if use_gpu:
+                    images = Variable(self.preproc(cropped_image)[0].unsqueeze(0).cuda(), volatile=True)
+                else:
+                    images = Variable(self.preproc(cropped_image)[0].unsqueeze(0), volatile=True)
+    
+                # forward
+                out = model(images, phase='eval')
+        
+                # detect
+                detections = detector.forward(out)
 
-            out = (out[0], model.softmax(out[1].view(-1, model.num_classes)))
+                # TODO: make it smart:
+                for j in range(1, num_classes):
+                    for det in detections[0][j]:
+                        if det[0] > 0:
+                            d = det.cpu().numpy()
+                            #print (d)
+                            final_boxes.append(d[1:] * scale + pos)
+                            final_classes.append(j)
+                            final_scores.append(d[0])
+                t_boxes = np.array(final_boxes)
+                t_classes = np.array(final_classes)
+                t_scores = np.array(final_scores)
 
-            # detect
-            detections = detector.forward(out)
-
-            time = _t.toc()
-
-            # evals
-            label, score, npos, gt_label = cal_tp_fp(detections, targets, label, score, npos, gt_label)
-            size = cal_size(detections, targets, size)
-            loc_loss += loss_l.data[0]
-            conf_loss += loss_c.data[0]
-
-            # log per iter
-            log = '\r==>Eval: || {iters:d}/{epoch_size:d} in {time:.3f}s [{prograss}] || loc_loss: {loc_loss:.4f} cls_loss: {cls_loss:.4f}\r'.format(
-                    prograss='#'*int(round(10*iteration/epoch_size)) + '-'*int(round(10*(1-iteration/epoch_size))), iters=iteration, epoch_size=epoch_size,
-                    time=time, loc_loss=loss_l.data[0], cls_loss=loss_c.data[0])
-
-            sys.stdout.write(log)
-            sys.stdout.flush()
-
-        # eval mAP
-        prec, rec, ap = cal_pr(label, score, npos)
-
-        # log per epoch
-        sys.stdout.write('\r')
-        sys.stdout.flush()
-        log = '\r==>Eval: || Total_time: {time:.3f}s || loc_loss: {loc_loss:.4f} conf_loss: {conf_loss:.4f} || mAP: {mAP:.6f}\n'.format(mAP=ap,
-                time=_t.total_time, loc_loss=loc_loss/epoch_size, conf_loss=conf_loss/epoch_size)
-        sys.stdout.write(log)
-        sys.stdout.flush()
-
-        # log for tensorboard
-        writer.add_scalar('Eval/loc_loss', loc_loss/epoch_size, epoch)
-        writer.add_scalar('Eval/conf_loss', conf_loss/epoch_size, epoch)
-        writer.add_scalar('Eval/mAP', ap, epoch)
-        viz_pr_curve(writer, prec, rec, epoch)
-        viz_archor_strategy(writer, size, gt_label, epoch)
-
-    # TODO: HOW TO MAKE THE DATALOADER WITHOUT SHUFFLE
-    # def test_epoch(self, model, data_loader, detector, output_dir, use_gpu):
-    #     # sys.stdout.write('\r===> Eval mode\n')
-
-    #     model.eval()
-
-    #     num_images = len(data_loader.dataset)
-    #     num_classes = detector.num_classes
-    #     batch_size = data_loader.batch_size
-    #     all_boxes = [[[] for _ in range(num_images)] for _ in range(num_classes)]
-    #     empty_array = np.transpose(np.array([[],[],[],[],[]]),(1,0))
-
-    #     epoch_size = len(data_loader)
-    #     batch_iterator = iter(data_loader)
-
-    #     _t = Timer()
-
-    #     for iteration in iter(range((epoch_size))):
-    #         images, targets = next(batch_iterator)
-    #         targets = [[anno[0][1], anno[0][0], anno[0][1], anno[0][0]] for anno in targets] # contains the image size
-    #         if use_gpu:
-    #             images = Variable(images.cuda())
-    #         else:
-    #             images = Variable(images)
-
-    #         _t.tic()
-    #         # forward
-    #         out = model(images, is_train=False)
-
-    #         # detect
-    #         detections = detector.forward(out)
-
-    #         time = _t.toc()
-
-    #         # TODO: make it smart:
-    #         for i, (dets, scale) in enumerate(zip(detections, targets)):
-    #             for j in range(1, num_classes):
-    #                 cls_dets = list()
-    #                 for det in dets[j]:
-    #                     if det[0] > 0:
-    #                         d = det.cpu().numpy()
-    #                         score, box = d[0], d[1:]
-    #                         box *= scale
-    #                         box = np.append(box, score)
-    #                         cls_dets.append(box)
-    #                 if len(cls_dets) == 0:
-    #                     cls_dets = empty_array
-    #                 all_boxes[j][iteration*batch_size+i] = np.array(cls_dets)
-
-    #         # log per iter
-    #         log = '\r==>Test: || {iters:d}/{epoch_size:d} in {time:.3f}s [{prograss}]\r'.format(
-    #                 prograss='#'*int(round(10*iteration/epoch_size)) + '-'*int(round(10*(1-iteration/epoch_size))), iters=iteration, epoch_size=epoch_size,
-    #                 time=time)
-    #         sys.stdout.write(log)
-    #         sys.stdout.flush()
-
-    #     # write result to pkl
-    #     with open(os.path.join(output_dir, 'detections.pkl'), 'wb') as f:
-    #         pickle.dump(all_boxes, f, pickle.HIGHEST_PROTOCOL)
-
-    #     print('Evaluating detections')
-    #     data_loader.dataset.evaluate_detections(all_boxes, output_dir)
-
-
-    def test_epoch(self, model, data_loader, detector, output_dir, use_gpu):
-        model.eval()
-
-        dataset = data_loader.dataset
-        num_images = len(dataset)
-        num_classes = detector.num_classes
-        all_boxes = [[[] for _ in range(num_images)] for _ in range(num_classes)]
-        empty_array = np.transpose(np.array([[],[],[],[],[]]),(1,0))
-
-        _t = Timer()
-
-        for i in iter(range((num_images))):
-            img = dataset.pull_image(i)
-            scale = [img.shape[1], img.shape[0], img.shape[1], img.shape[0]]
-            if use_gpu:
-                images = Variable(dataset.preproc(img)[0].unsqueeze(0).cuda(), volatile=True)
-            else:
-                images = Variable(dataset.preproc(img)[0].unsqueeze(0), volatile=True)
-
-            _t.tic()
-            # forward
-            out = model(images, phase='eval')
-
-            # detect
-            detections = detector.forward(out)
-
-            time = _t.toc()
-
-            # TODO: make it smart:
-            for j in range(1, num_classes):
-                cls_dets = list()
-                for det in detections[0][j]:
-                    if det[0] > 0:
-                        d = det.cpu().numpy()
-                        score, box = d[0], d[1:]
-                        box *= scale
-                        box = np.append(box, score)
-                        cls_dets.append(box)
-                if len(cls_dets) == 0:
-                    cls_dets = empty_array
-                all_boxes[j][i] = np.array(cls_dets)
-
-            # log per iter
-            log = '\r==>Test: || {iters:d}/{epoch_size:d} in {time:.3f}s [{prograss}]\r'.format(
-                    prograss='#'*int(round(10*i/num_images)) + '-'*int(round(10*(1-i/num_images))), iters=i, epoch_size=num_images,
-                    time=time)
-            sys.stdout.write(log)
-            sys.stdout.flush()
-
-        # write result to pkl
-        with open(os.path.join(output_dir, 'detections.pkl'), 'wb') as f:
-            pickle.dump(all_boxes, f, pickle.HIGHEST_PROTOCOL)
-
-        # currently the COCO dataset do not return the mean ap or ap 0.5:0.95 values
-        print('Evaluating detections')
-        data_loader.dataset.evaluate_detections(all_boxes, output_dir)
-
-
-    def visualize_epoch(self, model, data_loader, priorbox, writer, epoch, use_gpu):
-        model.eval()
-
-        img_index = random.randint(0, len(data_loader.dataset)-1)
-
-        # get img
-        image = data_loader.dataset.pull_image(img_index)
-        anno = data_loader.dataset.pull_anno(img_index)
-
-        # visualize archor box
-        viz_prior_box(writer, priorbox, image, epoch)
-
-        # get preproc
-        preproc = data_loader.dataset.preproc
-        preproc.add_writer(writer, epoch)
-        # preproc.p = 0.6
-
-        # preproc image & visualize preprocess prograss
-        images = Variable(preproc(image, anno)[0].unsqueeze(0), volatile=True)
+        """
+        _t.tic()
         if use_gpu:
-            images = images.cuda()
-
-        # visualize feature map in base and extras
-        base_out = viz_module_feature_maps(writer, model.base, images, module_name='base', epoch=epoch)
-        extras_out = viz_module_feature_maps(writer, model.extras, base_out, module_name='extras', epoch=epoch)
-        # visualize feature map in feature_extractors
-        viz_feature_maps(writer, model(images, 'feature'), module_name='feature_extractors', epoch=epoch)
-
-        model.train()
-        images.requires_grad = True
-        images.volatile=False
-        base_out = viz_module_grads(writer, model, model.base, images, images, preproc.means, module_name='base', epoch=epoch)
-
-        # TODO: add more...
-
-    def eval_subimg_epoch(self, model, data_loader, detector, use_gpu):
-        model.eval()
-    
-        dataset = data_loader.dataset
-        num_images = len(dataset)
-        num_classes = detector.num_classes
-        
-        _t = Timer()
-        
-        APs = []
-        no_prediction = []
-    
-        for i in iter(range((num_images))):
-            raw_image = dataset.pull_image(i)
-
-            height, width = raw_image.shape[:2]
-
-            final_boxes = []
-            final_classes = []
-            final_scores = []
-
-            #"""
-            ratio = 0.7
-            cropped_width = int(math.ceil(width * ratio))
-            cropped_height = int(math.ceil(height * ratio))
-            
-            if width >= height:
-                width_step = [int(math.ceil(i * (1-ratio) / 3 * width)) for i in range(4)]
-                height_step = [int(math.ceil(i * (1-ratio) / 2 * height)) for i in range(3)]
-            else:
-                width_step = [int(math.ceil(i * (1-ratio) / 2 * width)) for i in range(3)]
-                height_step = [int(math.ceil(i * (1-ratio) / 3 * height)) for i in range(4)]
-        
-            step = 0
-            
-            _t.tic()
-            for left in width_step:
-                for upper in height_step:
-                    step += 1
-                    
-                    w = min(cropped_width, width - left)
-                    h = min(cropped_height, height - upper)
-                    pos = [left, upper, left, upper]
-                    scale = [w, h, w, h]
-
-                    cropped_image = raw_image[upper:upper+h, left:left+w]
-
-                    if use_gpu:
-                        images = Variable(dataset.preproc(cropped_image)[0].unsqueeze(0).cuda(), volatile=True)
-                    else:
-                        images = Variable(dataset.preproc(cropped_image)[0].unsqueeze(0), volatile=True)
-        
-                    # forward
-                    out = model(images, phase='eval')
-        
-                    # detect
-                    detections = detector.forward(out)
-
-                    # TODO: make it smart:
-                    for j in range(1, num_classes):
-                        for det in detections[0][j]:
-                            if det[0] > 0:
-                                d = det.cpu().numpy()
-                                #print (d)
-                                final_boxes.append(d[1:] * scale + pos)
-                                final_classes.append(j)
-                                final_scores.append(d[0])
-                    t_boxes = np.array(final_boxes)
-                    t_classes = np.array(final_classes)
-                    t_scores = np.array(final_scores)
-
-            """
-            _t.tic()
-            if use_gpu:
-                images = Variable(dataset.preproc(raw_image)[0].unsqueeze(0).cuda(), volatile=True)
-            else:
-                images = Variable(dataset.preproc(raw_image)[0].unsqueeze(0), volatile=True)
-            # forward
-            out = model(images, phase='eval')
-            # detect
-            detections = detector.forward(out)
-
-            scale = [width, height, width, height]
-            for j in range(1, num_classes):
-                for det in detections[0][j]:
-                    if det[0] > 0:
-                        d = det.cpu().numpy()
-                        #print (d)
-                        final_boxes.append(d[1:] * scale)
-                        final_classes.append(j)
-                        final_scores.append(d[0])
-            """
-
-            time = _t.toc()
-            final_boxes = np.array(final_boxes)
-            final_classes = np.array(final_classes)
-            final_scores = np.array(final_scores)
-
-            gt_bbox, gt_class_id = dataset.pull_formatted_anno(i)
-
-            # Comment out to visualize the ground truth
-            # subimg_utils.display_instances(raw_image, gt_bbox, gt_class_id, dataset.get_class_names(), np.array([1]*len(gt_bbox)))
-
-            AP = 0
-            if final_boxes.shape[0] == 0 or len(gt_bbox) == 0:
-                no_prediction.append(i)
-                print ("no predictions")
-                subimg_utils.display_instances(raw_image, np.array([]), np.array([]), dataset.get_class_names(), np.array([]))
-            else:
-                pick = subimg_utils.non_max_suppression(final_boxes, final_scores, 0)
-                
-                AP, precisions, recalls, overlaps = subimg_utils.compute_ap(gt_bbox, gt_class_id,
-                                                                            final_boxes[pick], final_classes[pick],
-                                                                            final_scores[pick])
-                
-                print (time, "=> AP: ", AP)
-                APs.append(AP)
-                    
-                subimg_utils.display_instances(raw_image, final_boxes[pick], final_classes[pick], dataset.get_class_names(), final_scores[pick])
-            # with open('ssdlite.txt', 'a+') as f:
-            #     f.write('{image}  {ap}\n'.format(image=i, ap=AP))
-            print ("-----------------------------")
-        print("=> mAP: ", np.mean(APs), " || minAP: ", min(APs), " || maxAP: ", max(APs))
-
-
-    def configure_optimizer(self, trainable_param, cfg):
-        if cfg.OPTIMIZER == 'sgd':
-            optimizer = optim.SGD(trainable_param, lr=cfg.LEARNING_RATE,
-                        momentum=cfg.MOMENTUM, weight_decay=cfg.WEIGHT_DECAY)
-        elif cfg.OPTIMIZER == 'rmsprop':
-            optimizer = optim.RMSprop(trainable_param, lr=cfg.LEARNING_RATE,
-                        momentum=cfg.MOMENTUM, alpha=cfg.MOMENTUM_2, eps=cfg.EPS, weight_decay=cfg.WEIGHT_DECAY)
-        elif cfg.OPTIMIZER == 'adam':
-            optimizer = optim.Adam(trainable_param, lr=cfg.LEARNING_RATE,
-                        betas=(cfg.MOMENTUM, cfg.MOMENTUM_2), eps=cfg.EPS, weight_decay=cfg.WEIGHT_DECAY)
+            images = Variable(self.preproc(raw_image)[0].unsqueeze(0).cuda(), volatile=True)
         else:
-            AssertionError('optimizer can not be recognized.')
-        return optimizer
+            images = Variable(self.preproc(raw_image)[0].unsqueeze(0), volatile=True)
+        # forward
+        out = model(images, phase='eval')
+        # detect
+        detections = detector.forward(out)
 
+        scale = [width, height, width, height]
+        for j in range(1, num_classes):
+            for det in detections[0][j]:
+                if det[0] > 0:
+                    d = det.cpu().numpy()
+                    #print (d)
+                    final_boxes.append(d[1:] * scale)
+                    final_classes.append(j)
+                    final_scores.append(d[0])
+        """
 
-    def configure_lr_scheduler(self, optimizer, cfg):
-        if cfg.SCHEDULER == 'step':
-            scheduler = lr_scheduler.StepLR(optimizer, step_size=cfg.STEPS[0], gamma=cfg.GAMMA)
-        elif cfg.SCHEDULER == 'multi_step':
-            scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=cfg.STEPS, gamma=cfg.GAMMA)
-        elif cfg.SCHEDULER == 'exponential':
-            scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=cfg.GAMMA)
-        elif cfg.SCHEDULER == 'SGDR':
-            scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.MAX_EPOCHS)
+        time = _t.toc()
+        print ("Time:", time)
+        final_boxes = np.array(final_boxes)
+        final_classes = np.array(final_classes)
+        final_scores = np.array(final_scores)
+
+        output = []
+        if final_boxes.shape[0] == 0:
+            print ("no predictions")
+            subimg_utils.display_instances(image, np.array([]), np.array([]), HOUSE_CLASSES, np.array([]))
         else:
-            AssertionError('scheduler can not be recognized.')
-        return scheduler
+            pick = subimg_utils.non_max_suppression(final_boxes, final_scores, 0)
+            subimg_utils.display_instances(image, final_boxes[pick], final_classes[pick], HOUSE_CLASSES, final_scores[pick])
+            for idx in pick:
+                output.append({'box': list(final_boxes[idx]), 'type': HOUSE_CLASSES[final_classes[idx]]})
 
+        json_object = json.dumps(output)
+        return json_object
 
-    def export_graph(self):
-        self.model.train(False)
-        dummy_input = Variable(torch.randn(1, 3, cfg.MODEL.IMAGE_SIZE[0], cfg.MODEL.IMAGE_SIZE[1])).cuda()
-        # Export the model
-        torch_out = torch.onnx._export(self.model,             # model being run
-                                       dummy_input,            # model input (or a tuple for multiple inputs)
-                                       "graph.onnx",           # where to save the model (can be a file or file-like object)
-                                       export_params=True)     # store the trained parameter weights inside the model file
-        # if not os.path.exists(cfg.EXP_DIR):
-        #     os.makedirs(cfg.EXP_DIR)
-        # self.writer.add_graph(self.model, (dummy_input, ))
-
-def visualize():
-    args = parse_args()
-    if args.config_file is not None:
-        cfg_from_file(args.config_file)
-    
-    model, priorbox = create_model(cfg.MODEL)
+def visualize(image):
+    cfg_from_file(config_file)
+    s = Solver()
+    return s.test_model(image)
 
 if __name__ == '__main__':
-    visualize()
+    args = parse_args()
+    print (visualize(cv2.imread(args.image_path, cv2.IMREAD_COLOR)))
