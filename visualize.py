@@ -96,7 +96,7 @@ class Solver(object):
         if self.use_gpu:
             checkpoint = torch.load(resume_checkpoint)
         else:
-            checkpoint = torch.load(resume_checkpoint, map_location='cpu')
+            checkpoint = torch.load(resume_checkpoint, map_location=lambda storage, loc: storage)
 
         # print("=> Weigths in the checkpoints:")
         # print([k for k, v in list(checkpoint.items())])
